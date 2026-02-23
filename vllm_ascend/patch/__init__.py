@@ -242,6 +242,32 @@
 #    Future Plan:
 #       Remove this patch when vLLM support these operators.
 #
+# ** Note: Qwen3.5 GatedDeltaNet (qwen3_5_text / qwen3_5_moe_text) **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   Qwen3_5GatedDeltaNet inherits from Qwen3NextGatedDeltaNet and does NOT
+#   override _forward_core. Therefore the patched _forward_core from
+#   patch_qwen3_next.py (Patch 10) is automatically inherited.
+#
+# ** Patch 10.1: File: worker/patch_qwen3_5.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `Qwen3_5GatedDeltaNet.__init__` + `Qwen3_5GatedDeltaNet.forward`
+#    Why:
+#       Qwen3.5 uses 4 separate projections (in_proj_qkv, in_proj_z,
+#       in_proj_b, in_proj_a), resulting in 4 GEMM calls per forward.
+#       The b/a projections (output dim = num_v_heads, e.g. 64) are
+#       extremely small GEMMs with very low NPU compute utilization.
+#    How:
+#       Override __init__ to register a forward pre-hook. The pre-hook
+#       runs once (before graph capture) and fuses weights INTO existing
+#       ColumnParallelLinear layers:
+#         in_proj_qkv.weight = cat(qkv_w, z_w)  — preserves custom op path
+#         in_proj_b.weight   = cat(b_w, a_w)     — preserves custom op path
+#       Forward uses self._projections_fused flag (no hasattr) for
+#       graph mode compatibility. Falls back for quantized models.
+#    Future Plan:
+#       Further optimize with fused_qkvzba_split_reshape_cat Triton
+#       kernel after implementing weight interleaving.
+#
 # ** 11. File: worker/patch_v2_eagle.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.gpu.spec_decode.eagle.EagleSpeculator.propose`
