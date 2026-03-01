@@ -22,7 +22,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import Range
 from vllm.logger import logger
 
-from vllm_ascend.compilation.passes.base_pattern import BasePattern
+from vllm_ascend.compilation.passes.base_pattern import BasePattern, _registered_patterns
 from vllm_ascend.utils import vllm_version_is
 
 if vllm_version_is("0.15.0"):
@@ -77,6 +77,34 @@ class MulsAddPattern(BasePattern):
 
         return replacement
 
+    def register(self, pm_pass):
+        """Override base register to use scale-based pattern_id instead of
+        eps-based, so multiple MulsAddPattern instances with different scales
+        can coexist."""
+        import torch._inductor.pattern_matcher as pm
+        import torchair
+
+        pattern_id = f"{self.__class__.__name__}_scale_{self.scale}"
+        if pattern_id in _registered_patterns:
+            return
+
+        pattern_fn = self.get_pattern()
+        replacement_fn = self.get_replacement()
+        example_inputs = self.get_inputs()
+
+        pm.register_replacement(
+            pattern_fn, replacement_fn, example_inputs, pm.fwd_only, pm_pass
+        )
+
+        torchair.register_replacement(
+            search_fn=pattern_fn,
+            replace_fn=replacement_fn,
+            example_inputs=example_inputs,
+            extra_check=self.get_extra_stream_scope_check(),
+        )
+
+        _registered_patterns.add(pattern_id)
+
 
 class MulsAddFusionPass(VllmInductorPass):
     """
@@ -95,10 +123,18 @@ class MulsAddFusionPass(VllmInductorPass):
             logger.debug("MulsAdd fusion not enabled: unsupported dtype %s", dtype)
             return
 
-        # Currently we only register a single pattern instance with a fixed
-        # scalar scale value. If needed, multiple instances with different
-        # scales can be added here in the future.
+        # Register default scale=1.0 pattern
         MulsAddPattern(vllm_config, scale=1.0).register(self.pattern_match_passes)
+
+        # Register routed_scaling_factor from model config (e.g. GLM5 uses 2.5)
+        routed_scaling_factor = getattr(
+            vllm_config.model_config.hf_text_config,
+            'routed_scaling_factor', None
+        )
+        if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+            MulsAddPattern(vllm_config, scale=routed_scaling_factor).register(
+                self.pattern_match_passes
+            )
 
     def __call__(self, graph: torch.fx.Graph) -> None:  # type: ignore[override]
         self.begin()

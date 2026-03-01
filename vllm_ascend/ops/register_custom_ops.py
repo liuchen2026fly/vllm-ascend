@@ -15,6 +15,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
+from vllm_ascend.ops.triton.mla_rope_fuse import mla_partial_rope_fake, mla_partial_rope_impl
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import npu_stream_switch, prefetch_stream
@@ -286,6 +287,14 @@ direct_register_custom_op(
     op_name="muls_add",
     op_func=muls_add_triton,
     fake_impl=_muls_add_impl_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="mla_partial_rope_assemble",
+    op_func=mla_partial_rope_impl,
+    fake_impl=mla_partial_rope_fake,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )

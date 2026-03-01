@@ -69,6 +69,11 @@ class GraphFusionPassManager:
 
             self.passes.append(MulsAddFusionPass(config))
 
+        if self.ascend_compilation_config.get("fuse_mla_rope", True):
+            from .passes.mla_rope_fusion_pass import MlaRopeFusionPass
+
+            self.passes.append(MlaRopeFusionPass(config))
+
         if config.compilation_config.pass_config.enable_sp:
             from .passes.sequence_parallelism import AscendSequenceParallelismPass
 
