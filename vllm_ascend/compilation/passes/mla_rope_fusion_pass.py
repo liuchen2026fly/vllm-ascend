@@ -110,7 +110,9 @@ class MlaRopeFusionPattern(BasePattern):
             # Assemble q and k using cat (functional equivalent of
             # slice_scatter in the FX graph)
             q_out = torch.cat([q_nope, q_pe_r], dim=-1)
-            k_out = torch.cat([k_nope, k_pe_r.expand_as(k_nope)], dim=-1)
+            k_out = torch.cat(
+                [k_nope, k_pe_r.expand(-1, k_nope.shape[1], -1)], dim=-1
+            )
 
             return q_out, k_out
 
