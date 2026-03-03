@@ -727,6 +727,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
         register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
 
+        self._kv_stream = torch.npu.Stream()
+
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -1395,11 +1397,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_q_c = q_c[:num_decode_tokens]
         cos = attn_metadata.decode.cos
         sin = attn_metadata.decode.sin
-        decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
-        decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
-        decode_k_pe, decode_k_nope = self.exec_kv_decode(decode_kv_no_split, cos, sin, kv_cache, decode_slots)
+
+        # KV side: run on a separate stream (RmsNorm + RoPE + write KV Cache)
+        kv_event = torch.npu.Event()
+        with torch.npu.stream(self._kv_stream):
+            self._kv_stream.wait_stream(torch.npu.current_stream())
+            decode_k_pe, decode_k_nope = self.exec_kv_decode(
+                decode_kv_no_split, cos, sin, kv_cache, decode_slots)
+            kv_event.record()
+
+        # Q side: run on the default stream (projection + BMM + RoPE)
+        decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
+        decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+
+        # Synchronize: wait for KV stream to finish
+        torch.npu.current_stream().wait_event(kv_event)
+
         return DecodeMLAPreprocessResult(decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
 
     def _mla_preprocess(self, layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv):
