@@ -95,17 +95,8 @@ class MulsAddFusionPass(VllmInductorPass):
             logger.debug("MulsAdd fusion not enabled: unsupported dtype %s", dtype)
             return
 
-        # Register default scale=1.0 pattern
-        MulsAddPattern(vllm_config, scale=1.0).register(
-            self.pattern_match_passes, pattern_id="MulsAddPattern_scale_1.0"
-        )
-
-        # Register routed_scaling_factor from model config (e.g. GLM5 uses 2.5)
         routed_scaling_factor = getattr(vllm_config.model_config.hf_text_config, "routed_scaling_factor", 1.0)
-        MulsAddPattern(vllm_config, scale=routed_scaling_factor).register(
-            self.pattern_match_passes,
-            pattern_id=f"MulsAddPattern_scale_{routed_scaling_factor}",
-        )
+        MulsAddPattern(vllm_config, scale=routed_scaling_factor).register(self.pattern_match_passes)
 
     def __call__(self, graph: torch.fx.Graph) -> None:  # type: ignore[override]
         self.begin()
