@@ -52,11 +52,20 @@ class AscendQwen3Next_GatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
-        forward_context = get_forward_context()
-        is_cuda_graph = forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
-        # triton grid should be less than 66536
+
+        # Check if we can use Triton fused split kernel
+        # Requirements:
+        #   1. GQA ratio must be an integer (V heads divisible by K heads)
+        #   2. Triton grid size must be within hardware limit (< 65536)
+        #
+        # Note: Removed CUDAGraph requirement - kernel works in all modes
+        # Note: Removed GQA ratio whitelist [1,2,4] - supports any integer ratio
+        gqa_ratio = self.num_v_heads // self.num_k_heads
+        is_gqa_ratio_valid = (self.num_v_heads % self.num_k_heads == 0)
         divide_grid = projected_states_qkvz.shape[0] * triton.cdiv(self.num_k_heads, self.tp_size)
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph and divide_grid < 65536:
+        is_grid_size_valid = divide_grid < 65536
+
+        if is_gqa_ratio_valid and is_grid_size_valid:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,

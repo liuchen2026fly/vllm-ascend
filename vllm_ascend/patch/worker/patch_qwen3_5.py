@@ -46,6 +46,13 @@ try:
 except ImportError:
     Qwen3_5GatedDeltaNet = None
 
+# Import fused RMSNormGated Triton kernel
+try:
+    from vllm_ascend.ops.triton.fla.fused_rmsnorm_gated import fused_rmsnorm_gated
+    _TRITON_RMSNORM_AVAILABLE = True
+except ImportError:
+    _TRITON_RMSNORM_AVAILABLE = False
+
 # Save original forward for fallback (quantized / LoRA models)
 if Qwen3_5GatedDeltaNet is not None:
     _original_qwen3_5_forward = Qwen3_5GatedDeltaNet.forward
@@ -163,13 +170,27 @@ class AscendQwen3_5GatedDeltaNet:
         )
 
         # ============================================================
-        # Part 3: Output Projection
+        # Part 3: Output Projection with Fused RMSNormGated
         # ============================================================
         z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
+
+        # Use fused Triton kernel if available, otherwise fallback to PyTorch
+        if _TRITON_RMSNORM_AVAILABLE and hasattr(self.norm, 'weight'):
+            # Fused path: RMSNorm + Gating in one kernel
+            # Note: norm.weight is the RMSNorm weight parameter
+            core_attn_out = fused_rmsnorm_gated(
+                core_attn_out,  # shape: (num_tokens, num_v_heads // tp_size, head_v_dim)
+                z,               # shape: (num_tokens, num_v_heads // tp_size, head_v_dim)
+                self.norm.weight,
+                eps=self.norm.eps,
+            )
+        else:
+            # Fallback path: use original PyTorch implementation
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            z = z.reshape(-1, z.shape[-1])
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
