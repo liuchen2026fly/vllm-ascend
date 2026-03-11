@@ -173,11 +173,20 @@ class AscendQwen3_5GatedDeltaNet:
         # Part 3: Output Projection with Fused RMSNormGated
         # ============================================================
         z_shape_og = z.shape
+        num_tokens = core_attn_out.shape[0]
 
-        # Use fused Triton kernel if available, otherwise fallback to PyTorch
-        if _TRITON_RMSNORM_AVAILABLE and hasattr(self.norm, 'weight'):
+        # Conditional optimization based on batch size:
+        # - Large batch (Prefill, num_tokens > 32): Use PyTorch (better parallelism)
+        # - Small batch (Decode, num_tokens <= 32): Use Triton fused kernel (less overhead)
+        use_fused_kernel = (
+            _TRITON_RMSNORM_AVAILABLE
+            and hasattr(self.norm, 'weight')
+            and num_tokens <= 32  # Threshold: fused kernel only benefits small batches
+        )
+
+        if use_fused_kernel:
             # Fused path: RMSNorm + Gating in one kernel
-            # Note: norm.weight is the RMSNorm weight parameter
+            # Optimized for Decode stage (small batch)
             core_attn_out = fused_rmsnorm_gated(
                 core_attn_out,  # shape: (num_tokens, num_v_heads // tp_size, head_v_dim)
                 z,               # shape: (num_tokens, num_v_heads // tp_size, head_v_dim)
@@ -185,7 +194,8 @@ class AscendQwen3_5GatedDeltaNet:
                 eps=self.norm.eps,
             )
         else:
-            # Fallback path: use original PyTorch implementation
+            # PyTorch path: separate RMSNorm + Gating
+            # Optimized for Prefill stage (large batch) or when Triton unavailable
             core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
             z = z.reshape(-1, z.shape[-1])
             core_attn_out = self.norm(core_attn_out, z)
