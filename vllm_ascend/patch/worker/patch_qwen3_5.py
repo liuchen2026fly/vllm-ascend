@@ -37,6 +37,7 @@ Benefits:
   - Reduces kernel launch overhead
 """
 
+import os
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -53,9 +54,24 @@ try:
 except ImportError:
     _TRITON_RMSNORM_AVAILABLE = False
 
+# Import fused split/reshape Triton kernel
+try:
+    from vllm_ascend.ops.triton.fla.fused_qwen3_5_split import fused_qwen3_5_split_reshape
+    from vllm.triton_utils import triton
+    _TRITON_SPLIT_AVAILABLE = True
+except ImportError:
+    _TRITON_SPLIT_AVAILABLE = False
+    triton = None
+
 # Save original forward for fallback (quantized / LoRA models)
 if Qwen3_5GatedDeltaNet is not None:
     _original_qwen3_5_forward = Qwen3_5GatedDeltaNet.forward
+
+# Configurable threshold for RMSNormGated Triton kernel
+# Environment variable allows runtime tuning without code changes
+# Default: 32 (use Triton for batches <= 32, PyTorch for larger batches)
+# Tuning guide: Try 16, 24, 32, 48, 64 and benchmark to find optimal value
+_RMSNORM_TRITON_THRESHOLD = int(os.environ.get('QWEN3_5_RMSNORM_THRESHOLD', '32'))
 
 
 class AscendQwen3_5GatedDeltaNet:
@@ -127,6 +143,12 @@ class AscendQwen3_5GatedDeltaNet:
           GEMM 2 (ba):   hidden_states @ fused_ba_weight^T   → split → b, a
         Part 2: Core attention (_forward_core inherited from patch_qwen3_next.py)
         Part 3: RMSNormGated + output projection
+
+        ACLGraph Support:
+          This implementation is graph-compatible for decode optimization.
+          Enable via: --enforce-eager=False
+          The fused kernels (split, RMSNormGated) work seamlessly with ACLGraph.
+          Graph capture happens automatically in decode mode for maximum performance.
         """
         # Lazy fusion on first call; fallback if fusion not possible
         if not hasattr(self, '_projections_fused'):
@@ -143,14 +165,38 @@ class AscendQwen3_5GatedDeltaNet:
 
         # GEMM 1: qkvz — fuses in_proj_qkv + in_proj_z
         qkvz_out = F.linear(hidden_states, self._fused_qkvz_weight)
-        mixed_qkv = qkvz_out[:, :self._qkv_out_dim].contiguous()
-        z = qkvz_out[:, self._qkv_out_dim:].contiguous()
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
 
         # GEMM 2: ba — fuses in_proj_b + in_proj_a
         ba_out = F.linear(hidden_states, self._fused_ba_weight)
-        b = ba_out[:, :self._b_out_dim].contiguous()
-        a = ba_out[:, self._b_out_dim:].contiguous()
+
+        # Conditional optimization: use fused Triton kernel for split/reshape
+        # Requirements:
+        #   1. Triton kernel available
+        #   2. Grid size within hardware limit (< 65536)
+        use_fused_split = (
+            _TRITON_SPLIT_AVAILABLE
+            and num_tokens < 65536  # NPU grid size limit
+        )
+
+        if use_fused_split:
+            # Fused path: single Triton kernel for all splits + reshape
+            # Replaces 5 operations: 4 splits + 1 reshape
+            num_v_heads_local = self.num_v_heads // self.tp_size
+            mixed_qkv, z, b, a = fused_qwen3_5_split_reshape(
+                qkvz_out,
+                ba_out,
+                self._qkv_out_dim,
+                self._b_out_dim,
+                num_v_heads_local,
+                self.head_v_dim,
+            )
+        else:
+            # Python fallback path: separate splits + reshape
+            mixed_qkv = qkvz_out[:, :self._qkv_out_dim].contiguous()
+            z = qkvz_out[:, self._qkv_out_dim:].contiguous()
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b = ba_out[:, :self._b_out_dim].contiguous()
+            a = ba_out[:, self._b_out_dim:].contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -176,12 +222,13 @@ class AscendQwen3_5GatedDeltaNet:
         num_tokens = core_attn_out.shape[0]
 
         # Conditional optimization based on batch size:
-        # - Large batch (Prefill, num_tokens > 32): Use PyTorch (better parallelism)
-        # - Small batch (Decode, num_tokens <= 32): Use Triton fused kernel (less overhead)
+        # - Large batch (Prefill, num_tokens > threshold): Use PyTorch (better parallelism)
+        # - Small batch (Decode, num_tokens <= threshold): Use Triton fused kernel (less overhead)
+        # Threshold is configurable via QWEN3_5_RMSNORM_THRESHOLD environment variable
         use_fused_kernel = (
             _TRITON_RMSNORM_AVAILABLE
             and hasattr(self.norm, 'weight')
-            and num_tokens <= 32  # Threshold: fused kernel only benefits small batches
+            and num_tokens <= _RMSNORM_TRITON_THRESHOLD
         )
 
         if use_fused_kernel:

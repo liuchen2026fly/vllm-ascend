@@ -32,6 +32,15 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
+    ],
+    key=['n_cols'],
+)
 @triton.jit
 def _fused_rmsnorm_gated_kernel(
     output_ptr,
@@ -186,11 +195,10 @@ def fused_rmsnorm_gated(
     output = torch.empty_like(x_2d, dtype=x.dtype)
 
     # Kernel configuration
-    BLOCK_SIZE = 1024
     max_grid_size = get_vectorcore_num()
     grid = (min(n_rows, max_grid_size),)
 
-    # Launch kernel
+    # Launch kernel (BLOCK_SIZE is auto-tuned based on n_cols)
     _fused_rmsnorm_gated_kernel[grid](
         output,
         x_2d,
@@ -202,7 +210,6 @@ def fused_rmsnorm_gated(
         n_rows,
         n_cols,
         eps,
-        BLOCK_SIZE=BLOCK_SIZE,
     )
 
     return output.reshape(original_shape)
