@@ -430,17 +430,44 @@ class AscendMlaCPImpl(AscendMLAImpl):
         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
 
     def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata):
+        from vllm.triton_utils import HAS_TRITON
+
         num_decode_tokens = attn_metadata.num_decode_tokens
-        decode_q_c = q_c[:num_decode_tokens]
         cos = attn_metadata.decode.cos
         sin = attn_metadata.decode.sin
-        decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
-        decode_ql_nope, decode_q_pe = self.reorg_decode_q(decode_ql_nope, decode_q_pe)
-        decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens]
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
-        decode_k_pe, decode_k_nope = self.exec_kv_decode(decode_kv_no_split, cos, sin, kv_cache, decode_slots)
-        return DecodeMLAPreprocessResult(decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
+
+        # Optimized path: separate compute from scatter for DMA/GEMM overlap
+        if HAS_TRITON and not self.enable_kv_nz:
+            # 1. KV compute only (no cache write)
+            decode_k_pe, decode_k_nope = self.exec_kv_decode(
+                decode_kv_no_split, cos, sin, kv_cache, decode_slots,
+                skip_cache_write=True)
+
+            # 2. Scatter to cache (HBM DMA)
+            self._scatter_kv_to_cache(
+                decode_k_pe, decode_k_nope, kv_cache, decode_slots)
+
+            # 3. Q proj (AICore GEMM, overlaps with scatter DMA)
+            decode_q_c = q_c[:num_decode_tokens]
+            decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
+            decode_ql_nope, decode_q_pe = self.reorg_decode_q(decode_ql_nope, decode_q_pe)
+            decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+
+            # Return cache refs for attention kernel
+            return DecodeMLAPreprocessResult(
+                decode_ql_nope, decode_q_pe, kv_cache[0], kv_cache[1])
+        else:
+            # Fallback: original order
+            decode_q_c = q_c[:num_decode_tokens]
+            decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
+            decode_ql_nope, decode_q_pe = self.reorg_decode_q(decode_ql_nope, decode_q_pe)
+            decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+            decode_k_pe, decode_k_nope = self.exec_kv_decode(
+                decode_kv_no_split, cos, sin, kv_cache, decode_slots)
+            return DecodeMLAPreprocessResult(
+                decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
 
     def get_context_seq_len_npu(self, index: int, attn_metadata: AscendMLAMetadata):
         prefill_metadata = attn_metadata.prefill

@@ -551,6 +551,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
         attn_metadata: M,
+        skip_cache_write: bool = False,
     ):
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
@@ -560,6 +561,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         cache_mode = "PA"
 
         if self.enable_dsa_cp:
+            # dsa_cp always outputs dense (is_output_kv=True), scatter done in forward
             if HAS_TRITON:
                 _, _, k_pe, k_nope = triton_kv_rmsnorm_rope_cache(
                     kv_no_split,
@@ -588,7 +590,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             return k_pe, k_nope
         else:
-            if HAS_TRITON:
+            if HAS_TRITON and skip_cache_write:
+                # Compute only, skip PA scatter — returns dense (k_pe, k_nope)
+                _, _, k_pe, k_nope = triton_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos,
+                    sin,
+                    slots.to(torch.int64),
+                    kv_cache[1],
+                    kv_cache[0],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                    cache_mode=cache_mode,
+                    is_output_kv=True,
+                    skip_cache_write=True,
+                )
+                return k_pe, k_nope
+            elif HAS_TRITON:
                 triton_kv_rmsnorm_rope_cache(
                     kv_no_split,
                     self.kv_a_layernorm.weight,  # type: ignore[union-attr]
@@ -600,6 +618,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
                     cache_mode=cache_mode,
                 )
+                return None, None
             else:
                 torch_npu.npu_kv_rmsnorm_rope_cache(
                     kv_no_split,
@@ -612,7 +631,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
                     cache_mode=cache_mode,
                 )
-            return None, None
+                return None, None
 
     def rope_single(
         self,
@@ -844,7 +863,28 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query = attn_metadata.dsa_cp_context.actual_seq_lengths_query
                 actual_seq_lengths_key = attn_metadata.dsa_cp_context.actual_seq_lengths_key
 
-            k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+            if not self.enable_dsa_cp and HAS_TRITON:
+                # Optimized path: separate compute from scatter for DMA/GEMM overlap
+                k_pe, k_nope = self.exec_kv(
+                    kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata,
+                    skip_cache_write=True)
+
+                # Scatter to cache (HBM DMA)
+                if kv_cache is not None:
+                    _slot = slot_mapping.view(-1, 1)
+                    torch_npu.npu_scatter_nd_update_(
+                        kv_cache[0].view(-1, k_nope.shape[-1]),
+                        _slot,
+                        k_nope.view(-1, k_nope.shape[-1]),
+                    )
+                    torch_npu.npu_scatter_nd_update_(
+                        kv_cache[1].view(-1, k_pe.shape[-1]),
+                        _slot,
+                        k_pe.view(-1, k_pe.shape[-1]),
+                    )
+            else:
+                k_pe, k_nope = self.exec_kv(
+                    kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -859,6 +899,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     async_op=should_shard_weight,
                 )
 
+            # Q proj (AICore GEMM, overlaps with scatter DMA on optimized path)
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
 

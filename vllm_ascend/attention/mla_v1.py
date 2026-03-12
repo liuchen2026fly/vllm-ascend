@@ -1105,6 +1105,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         kv_cache: tuple,
         slots: torch.Tensor,
+        skip_cache_write: bool = False,
     ):
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
@@ -1113,17 +1114,33 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA_NZ" if self.enable_kv_nz else "PA"
         if HAS_TRITON and cache_mode == "PA":
-            k_pe, k_nope, _, _ = triton_kv_rmsnorm_rope_cache(
-                kv_no_split,
-                self.kv_a_layernorm.weight,  # type: ignore[union-attr]
-                cos,
-                sin,
-                slots.to(torch.int64),
-                kv_cache[1],
-                kv_cache[0],
-                epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
-                cache_mode=cache_mode,
-            )
+            if skip_cache_write:
+                # Compute only, skip PA scatter — returns dense (k_pe, k_nope)
+                _, _, k_pe, k_nope = triton_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos,
+                    sin,
+                    slots.to(torch.int64),
+                    kv_cache[1],
+                    kv_cache[0],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                    cache_mode=cache_mode,
+                    is_output_kv=True,
+                    skip_cache_write=True,
+                )
+            else:
+                k_pe, k_nope, _, _ = triton_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos,
+                    sin,
+                    slots.to(torch.int64),
+                    kv_cache[1],
+                    kv_cache[0],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                    cache_mode=cache_mode,
+                )
         else:
             k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
@@ -1137,6 +1154,20 @@ class AscendMLAImpl(MLAAttentionImpl):
                 cache_mode=cache_mode,
             )
         return k_pe, k_nope
+
+    def _scatter_kv_to_cache(self, k_pe, k_nope, kv_cache, slots):
+        """Scatter dense k_pe/k_nope into PA cache via DMA."""
+        slot_mapping = slots.view(-1, 1)
+        torch_npu.npu_scatter_nd_update_(
+            kv_cache[1].view(-1, k_pe.shape[-1]),
+            slot_mapping,
+            k_pe.view(-1, k_pe.shape[-1]),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            kv_cache[0].view(-1, k_nope.shape[-1]),
+            slot_mapping,
+            k_nope.view(-1, k_nope.shape[-1]),
+        )
 
     def exec_kv_prefill(
         self,
@@ -1425,15 +1456,39 @@ class AscendMLAImpl(MLAAttentionImpl):
 
     def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata):
         num_decode_tokens = attn_metadata.num_decode_tokens
-        decode_q_c = q_c[:num_decode_tokens]
         cos = attn_metadata.decode.cos
         sin = attn_metadata.decode.sin
-        decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
-        decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
-        decode_k_pe, decode_k_nope = self.exec_kv_decode(decode_kv_no_split, cos, sin, kv_cache, decode_slots)
-        return DecodeMLAPreprocessResult(decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
+
+        # Optimized path: separate compute from scatter to overlap with Q proj
+        if HAS_TRITON and not self.enable_kv_nz:
+            # 1. KV compute only (no cache write)
+            decode_k_pe, decode_k_nope = self.exec_kv_decode(
+                decode_kv_no_split, cos, sin, kv_cache, decode_slots,
+                skip_cache_write=True)
+
+            # 2. Scatter to cache (HBM DMA)
+            self._scatter_kv_to_cache(
+                decode_k_pe, decode_k_nope, kv_cache, decode_slots)
+
+            # 3. Q proj (AICore GEMM, overlaps with scatter DMA)
+            decode_q_c = q_c[:num_decode_tokens]
+            decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
+            decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+
+            # Return cache refs for attention kernel
+            return DecodeMLAPreprocessResult(
+                decode_ql_nope, decode_q_pe, kv_cache[0], kv_cache[1])
+        else:
+            # Fallback: fused compute + scatter (torch_npu or PA_NZ)
+            decode_q_c = q_c[:num_decode_tokens]
+            decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
+            decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+            decode_k_pe, decode_k_nope = self.exec_kv_decode(
+                decode_kv_no_split, cos, sin, kv_cache, decode_slots)
+            return DecodeMLAPreprocessResult(
+                decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
 
     def _mla_preprocess(self, layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv):
         # MLA Preprocess:

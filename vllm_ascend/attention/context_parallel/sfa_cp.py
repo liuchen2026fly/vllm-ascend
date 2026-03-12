@@ -410,9 +410,12 @@ class AscendSFACPImpl(AscendSFAImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
         attn_metadata: M,
+        skip_cache_write: bool = False,
     ):
         if self.pcp_size == 1:
-            return super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
+            return super().exec_kv(
+                kv_no_split, cos, sin, kv_cache, slots, attn_metadata,
+                skip_cache_write=skip_cache_write)
         kv_c, k_pe = kv_no_split.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())  # type: ignore[misc]
         assert len(kv_cache) > 1, "the number of kv cache should be greater than 1, namely (nope_cache and rope_cache)"

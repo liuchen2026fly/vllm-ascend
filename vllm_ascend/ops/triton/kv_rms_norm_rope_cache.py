@@ -52,6 +52,7 @@ def _kv_rnrc_v1_kernel(
     IS_OUTPUT_KV:    tl.constexpr,
     K_CACHE_DIM:     tl.constexpr,   # k_cache per-slot dim (= D_ROPE)
     V_CACHE_DIM:     tl.constexpr,   # v_cache per-slot dim (= D_RMS)
+    SKIP_CACHE_WRITE: tl.constexpr = False,
 ):
     pid = tl.program_id(0).to(tl.int64)
     num_cores = tl.num_programs(0)
@@ -94,20 +95,22 @@ def _kv_rnrc_v1_kernel(
         v_norm = v * inv_rms * gamma
 
         # ---------- PA Scatter ----------
-        pa_slot = tl.load(index_ptr + token_idx).to(tl.int32)
-        valid = pa_slot >= 0
-        safe_slot = tl.maximum(pa_slot, 0).to(tl.int64)
         out_dtype = kv_ptr.dtype.element_ty
 
-        k_dst = safe_slot * K_CACHE_DIM
-        tl.store(k_cache_ptr + k_dst + h,
-                 rope_real.to(out_dtype), mask=h_mask & valid)
-        tl.store(k_cache_ptr + k_dst + D_ROPE_HALF + h,
-                 rope_imag.to(out_dtype), mask=h_mask & valid)
+        if not SKIP_CACHE_WRITE:
+            pa_slot = tl.load(index_ptr + token_idx).to(tl.int32)
+            valid = pa_slot >= 0
+            safe_slot = tl.maximum(pa_slot, 0).to(tl.int64)
 
-        v_dst = safe_slot * V_CACHE_DIM
-        tl.store(v_cache_ptr + v_dst + d,
-                 v_norm.to(out_dtype), mask=d_mask & valid)
+            k_dst = safe_slot * K_CACHE_DIM
+            tl.store(k_cache_ptr + k_dst + h,
+                     rope_real.to(out_dtype), mask=h_mask & valid)
+            tl.store(k_cache_ptr + k_dst + D_ROPE_HALF + h,
+                     rope_imag.to(out_dtype), mask=h_mask & valid)
+
+            v_dst = safe_slot * V_CACHE_DIM
+            tl.store(v_cache_ptr + v_dst + d,
+                     v_norm.to(out_dtype), mask=d_mask & valid)
 
         if IS_OUTPUT_KV:
             tl.store(k_out_ptr + token_idx * D_ROPE + h,
@@ -145,6 +148,7 @@ def _kv_rnrc_v2_kernel(
     IS_OUTPUT_KV:    tl.constexpr,
     K_CACHE_DIM:     tl.constexpr,  # = D_RMS
     V_CACHE_DIM:     tl.constexpr,  # = D_V
+    SKIP_CACHE_WRITE: tl.constexpr = False,
 ):
     pid = tl.program_id(0).to(tl.int64)
     num_cores = tl.num_programs(0)
@@ -203,27 +207,29 @@ def _kv_rnrc_v2_kernel(
         # we store in two passes: rope portion + remaining portion
 
         out_dtype = kv_ptr.dtype.element_ty
-        pa_slot = tl.load(index_ptr + token_idx).to(tl.int32)
-        valid = pa_slot >= 0
-        safe_slot = tl.maximum(pa_slot, 0).to(tl.int64)
-
-        # Store k_cache: first write the full k_norm, then overwrite rope portion
-        k_dst = safe_slot * K_CACHE_DIM
-        # Full D_RMS (non-rope portion)
-        tl.store(k_cache_ptr + k_dst + dk,
-                 k_norm.to(out_dtype), mask=dk_mask & valid)
-        # Overwrite first D_ROPE dims with rotated values
-        tl.store(k_cache_ptr + k_dst + h * 2,
-                 rope_real.to(out_dtype), mask=h_mask & valid)
-        tl.store(k_cache_ptr + k_dst + h * 2 + 1,
-                 rope_imag.to(out_dtype), mask=h_mask & valid)
-
-        # V passthrough → v_cache
         v_data = tl.load(v_ptr + token_idx * v_stride + dv,
                          mask=dv_mask, other=0.0)
-        v_dst = safe_slot * V_CACHE_DIM
-        tl.store(v_cache_ptr + v_dst + dv,
-                 v_data, mask=dv_mask & valid)
+
+        if not SKIP_CACHE_WRITE:
+            pa_slot = tl.load(index_ptr + token_idx).to(tl.int32)
+            valid = pa_slot >= 0
+            safe_slot = tl.maximum(pa_slot, 0).to(tl.int64)
+
+            # Store k_cache: first write the full k_norm, then overwrite rope portion
+            k_dst = safe_slot * K_CACHE_DIM
+            # Full D_RMS (non-rope portion)
+            tl.store(k_cache_ptr + k_dst + dk,
+                     k_norm.to(out_dtype), mask=dk_mask & valid)
+            # Overwrite first D_ROPE dims with rotated values
+            tl.store(k_cache_ptr + k_dst + h * 2,
+                     rope_real.to(out_dtype), mask=h_mask & valid)
+            tl.store(k_cache_ptr + k_dst + h * 2 + 1,
+                     rope_imag.to(out_dtype), mask=h_mask & valid)
+
+            # V passthrough → v_cache
+            v_dst = safe_slot * V_CACHE_DIM
+            tl.store(v_cache_ptr + v_dst + dv,
+                     v_data, mask=dv_mask & valid)
 
         if IS_OUTPUT_KV:
             # k_out: write full D_RMS with rope applied
@@ -251,6 +257,7 @@ def kv_rms_norm_rope_cache(
     v_input: torch.Tensor = None,   # METHOD_V2: separate V
     epsilon: float = 1e-6,
     is_output_kv: bool = True,
+    skip_cache_write: bool = False,
 ) -> tuple:
     """
     Unified entry supporting both METHOD_V1 and METHOD_V2.
@@ -261,6 +268,10 @@ def kv_rms_norm_rope_cache(
       - V1 if kv.shape[-1] == D_RMS + D_ROPE  (kv = [V | K] concatenated)
       - V2 if kv.shape[-1] == D_RMS            (kv = K only, v_input required)
     """
+    # When skipping cache write, force output dense tensors
+    if skip_cache_write:
+        is_output_kv = True
+
     # ---- Derive dimensions from input shapes ----
     D_ROPE = cos.shape[-1]
     D_ROPE_HALF = D_ROPE // 2
@@ -330,6 +341,7 @@ def kv_rms_norm_rope_cache(
             IS_OUTPUT_KV=is_output_kv,
             K_CACHE_DIM=K_CACHE_DIM,
             V_CACHE_DIM=V_CACHE_DIM,
+            SKIP_CACHE_WRITE=skip_cache_write,
             multibuffer=True,
         )
     else:
@@ -364,6 +376,7 @@ def kv_rms_norm_rope_cache(
             IS_OUTPUT_KV=is_output_kv,
             K_CACHE_DIM=K_CACHE_DIM,
             V_CACHE_DIM=V_CACHE_DIM,
+            SKIP_CACHE_WRITE=skip_cache_write,
             multibuffer=True,
         )
 
@@ -384,6 +397,7 @@ def npu_kv_rmsnorm_rope_cache(
     epsilon: float = 1e-6,
     cache_mode: str = "PA",
     is_output_kv: bool = False,
+    skip_cache_write: bool = False,
 ) -> tuple:
     """
     Drop-in replacement for torch_npu.npu_kv_rmsnorm_rope_cache.
@@ -463,14 +477,27 @@ def npu_kv_rmsnorm_rope_cache(
         k_nope = v_out.view(*batch_shape, D_RMS)
         return (None, None, k_pe, k_nope)
     else:
-        # Decode: write cache only, return cache tensors directly
-        kv_rms_norm_rope_cache(
-            kv_flat, gamma, cos_flat, sin_flat, slots,
-            k_pe_cache, k_nope_cache,
-            epsilon=epsilon,
-            is_output_kv=False,
-        )
-        return (k_pe_cache, k_nope_cache, None, None)
+        if skip_cache_write:
+            # Decode compute-only: skip PA scatter, return dense outputs
+            k_out, v_out, _, _ = kv_rms_norm_rope_cache(
+                kv_flat, gamma, cos_flat, sin_flat, slots,
+                k_pe_cache, k_nope_cache,
+                epsilon=epsilon,
+                is_output_kv=True,
+                skip_cache_write=True,
+            )
+            k_pe = k_out.view(*batch_shape, D_ROPE)
+            k_nope = v_out.view(*batch_shape, D_RMS)
+            return (None, None, k_pe, k_nope)
+        else:
+            # Decode: write cache only, return cache tensors directly
+            kv_rms_norm_rope_cache(
+                kv_flat, gamma, cos_flat, sin_flat, slots,
+                k_pe_cache, k_nope_cache,
+                epsilon=epsilon,
+                is_output_kv=False,
+            )
+            return (k_pe_cache, k_nope_cache, None, None)
 
 
 # ===================================================================
