@@ -12,6 +12,10 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.triton_utils import HAS_TRITON
+if HAS_TRITON:
+    from vllm_ascend.ops.triton.kv_rms_norm_rope_cache import (
+        npu_kv_rmsnorm_rope_cache as triton_kv_rmsnorm_rope_cache,
+    )
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MLAAttentionImpl  # type: ignore
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -556,31 +560,58 @@ class AscendSFAImpl(MLAAttentionImpl):
         cache_mode = "PA"
 
         if self.enable_dsa_cp:
-            _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
-                kv_no_split,
-                self.kv_a_layernorm.weight,  # type: ignore[union-attr]
-                cos,
-                sin,
-                slots.to(torch.int64),
-                kv_cache[1],
-                kv_cache[0],
-                epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
-                cache_mode=cache_mode,
-                is_output_kv=True,
-            )
+            if HAS_TRITON:
+                _, _, k_pe, k_nope = triton_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos,
+                    sin,
+                    slots.to(torch.int64),
+                    kv_cache[1],
+                    kv_cache[0],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                    cache_mode=cache_mode,
+                    is_output_kv=True,
+                )
+            else:
+                _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos,
+                    sin,
+                    slots.to(torch.int64),
+                    kv_cache[1],
+                    kv_cache[0],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                    cache_mode=cache_mode,
+                    is_output_kv=True,
+                )
             return k_pe, k_nope
         else:
-            torch_npu.npu_kv_rmsnorm_rope_cache(
-                kv_no_split,
-                self.kv_a_layernorm.weight,  # type: ignore[union-attr]
-                cos,
-                sin,
-                slots.to(torch.int64),
-                kv_cache[1],
-                kv_cache[0],
-                epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
-                cache_mode=cache_mode,
-            )
+            if HAS_TRITON:
+                triton_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos,
+                    sin,
+                    slots.to(torch.int64),
+                    kv_cache[1],
+                    kv_cache[0],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                    cache_mode=cache_mode,
+                )
+            else:
+                torch_npu.npu_kv_rmsnorm_rope_cache(
+                    kv_no_split,
+                    self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                    cos,
+                    sin,
+                    slots.to(torch.int64),
+                    kv_cache[1],
+                    kv_cache[0],
+                    epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                    cache_mode=cache_mode,
+                )
             return None, None
 
     def rope_single(
