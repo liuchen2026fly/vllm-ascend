@@ -228,6 +228,14 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         "moe_quantize",
         getattr(vllm_config.model_config.hf_text_config, "quantize", None),
     )
+    # Fallback: read MoE quant type from ModelSlim quant_description
+    # when config.json lacks moe_quantize/quantize fields.
+    if quant_type is None and vllm_config.quant_config is not None:
+        quant_desc = getattr(vllm_config.quant_config, "quant_description", {})
+        for key, val in quant_desc.items():
+            if "experts" in key and val != "FLOAT":
+                quant_type = val.lower()
+                break
 
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
