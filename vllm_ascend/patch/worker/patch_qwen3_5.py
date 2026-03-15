@@ -37,10 +37,13 @@ Benefits:
   - Reduces kernel launch overhead
 """
 
+import logging
 import os
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+
+logger = logging.getLogger(__name__)
 
 try:
     from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
@@ -98,6 +101,10 @@ class AscendQwen3_5GatedDeltaNet:
                    self.in_proj_b, self.in_proj_a]
         if not all(hasattr(m, 'weight') and m.weight is not None
                    for m in modules):
+            logger.warning(
+                "[Qwen3.5 Patch] Projection fusion FAILED: "
+                "missing weight tensors. Using original 4-GEMM path."
+            )
             self._projections_fused = False
             return False
 
@@ -108,6 +115,13 @@ class AscendQwen3_5GatedDeltaNet:
 
         # Only fuse plain float weights (not quantized int4/int8)
         if not all(w.is_floating_point() for w in [qkv_w, z_w, b_w, a_w]):
+            logger.warning(
+                "[Qwen3.5 Patch] Projection fusion FAILED: "
+                "non-float weights detected (quantized?). "
+                "dtypes: qkv=%s, z=%s, b=%s, a=%s. "
+                "Using original 4-GEMM path.",
+                qkv_w.dtype, z_w.dtype, b_w.dtype, a_w.dtype,
+            )
             self._projections_fused = False
             return False
 
@@ -127,6 +141,17 @@ class AscendQwen3_5GatedDeltaNet:
             [b_w.data, a_w.data], dim=0,
         ).contiguous()
 
+        logger.warning(
+            "[Qwen3.5 Patch] Projection fusion SUCCESS: "
+            "qkvz=[%d+%d], ba=[%d+%d], dtype=%s. "
+            "Triton split=%s, Triton RMSNorm=%s (threshold=%d).",
+            self._qkv_out_dim, self._z_out_dim,
+            self._b_out_dim, self._a_out_dim,
+            qkv_w.dtype,
+            _TRITON_SPLIT_AVAILABLE,
+            _TRITON_RMSNORM_AVAILABLE,
+            _RMSNORM_TRITON_THRESHOLD,
+        )
         self._projections_fused = True
         return True
 
